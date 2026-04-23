@@ -1,0 +1,461 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 Soteria LLC (https://github.com/soteria-security)
+
+name: Pin Workflow Actions to Commit SHA (Org-Wide)
+
+on:
+  workflow_dispatch:
+    inputs:
+      org:
+        description: "GitHub org to target"
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run: log proposed changes only — no branches, commits, or PRs"
+        required: false
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+      target_repo:
+        description: "Process a single repo by name (leave blank for all non-archived org repos)"
+        required: false
+        default: ""
+
+env:
+  ORG: ${{ inputs.org }}
+  BRANCH_NAME: security/pin-actions-to-sha
+  PR_TITLE: "security: pin GitHub Actions to full-length commit SHAs"
+  # Check https://github.com/sethvargo/ratchet/releases for the latest version.
+  RATCHET_VERSION: "0.11.4"
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 1: Enumerate target repos and output a JSON array for the matrix.
+  #
+  # NOTE: GitHub Actions matrices are capped at 256 entries per dimension.
+  # If the org exceeds 256 non-archived repos, chunking would be required.
+  # ─────────────────────────────────────────────────────────────────────────
+  list-repos:
+    name: List target repos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          app-id: ${{ secrets.PIN_ACTIONS_APP_ID }}
+          private-key: ${{ secrets.PIN_ACTIONS_APP_PRIVATE_KEY }}
+          owner: ${{ env.ORG }}
+
+      - name: Build repo matrix
+        id: list
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${{ inputs.target_repo }}" ]]; then
+              matrix=$(jq -cn --arg r "${{ inputs.target_repo }}" '[$r]')
+          else
+              # --paginate follows GitHub's Link headers to retrieve all pages
+              # automatically. jq filters archived repos and outputs a compact
+              # JSON array suitable for use as a GitHub Actions matrix.
+              matrix=$(gh api "orgs/${ORG}/repos" --paginate \
+                  | jq -c '[.[] | select(.archived == false) | .name]')
+          fi
+
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "Targeting $(echo "$matrix" | jq length) repo(s)"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 2: For each repo — checkout → pin with ratchet → diff → PR
+  # ─────────────────────────────────────────────────────────────────────────
+  pin-actions:
+    name: "${{ inputs.dry_run == 'true' && 'DRY RUN' || 'LIVE' }} — ${{ matrix.repo }}"
+    needs: list-repos
+    if: needs.list-repos.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # this workflow's own repo only; target repo access is via GitHub App token
+      actions: write # required to upload workflow artifacts (for metrics JSON, etc.)
+    strategy:
+      fail-fast: false # a failure in one repo must not abort the others
+      max-parallel: 5 # cap concurrency to avoid GitHub API rate-limit pressure
+      matrix:
+        repo: ${{ fromJson(needs.list-repos.outputs.matrix) }}
+    env:
+      DRY_RUN: ${{ inputs.dry_run }}
+
+    steps:
+      # ── 1. Generate a short-lived GitHub App installation token ───────
+      # Commits created via the Contents API using an App token are
+      # automatically signed by GitHub, satisfying branch protection rules
+      # that require verified (signed) commits (e.g. vigilant mode).
+      # This also removes the dependency on any individual's personal PAT.
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+        with:
+          app-id: ${{ secrets.PIN_ACTIONS_APP_ID }}
+          private-key: ${{ secrets.PIN_ACTIONS_APP_PRIVATE_KEY }}
+          owner: ${{ env.ORG }}
+
+      # ── 2. Checkout the target repo ───────────────────────────────────
+      # The App token configures git's credential helper for authenticated
+      # git operations; this workflow commits via the Contents API rather
+      # than using `git push`.
+      - name: Check out ${{ env.ORG }}/${{ matrix.repo }}
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ env.ORG }}/${{ matrix.repo }}
+          token: ${{ steps.app-token.outputs.token }}
+
+      # ── 3. Skip repos that have no workflow files ─────────────────────
+      - name: Detect workflow files
+        id: detect
+        run: |
+          count=$(find .github/workflows -maxdepth 1 \
+              \( -name '*.yml' -o -name '*.yaml' \) -type f 2>/dev/null \
+              | wc -l | tr -d '[:space:]')
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          if [[ "$count" -eq 0 ]]; then
+              echo "No workflow files found in ${{ matrix.repo }} — skipping."
+          else
+              echo "Found ${count} workflow file(s)."
+          fi
+
+      # ── 3. Install ratchet ────────────────────────────────────────────
+      # ratchet rewrites 'uses:' lines from mutable semver tags to immutable
+      # commit SHAs, preserving the tag as an inline comment for readability.
+      # See: https://github.com/sethvargo/ratchet
+      #
+      # NOTE: This step verifies the downloaded binary against the SHA-512
+      # checksums file (ratchet_VERSION_SHA512SUMS) published alongside
+      # each release at: https://github.com/sethvargo/ratchet/releases.
+      - name: Install ratchet v${{ env.RATCHET_VERSION }}
+        if: steps.detect.outputs.count != '0'
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          tmpdir="$(mktemp -d)"
+          tarball="ratchet_${RATCHET_VERSION}_linux_amd64.tar.gz"
+          checksums="ratchet_${RATCHET_VERSION}_SHA512SUMS"
+          base_url="https://github.com/sethvargo/ratchet/releases/download/v${RATCHET_VERSION}"
+          curl -fsSL "${base_url}/${tarball}" -o "${tmpdir}/${tarball}"
+          curl -fsSL "${base_url}/${checksums}" -o "${tmpdir}/${checksums}"
+          (
+              cd "${tmpdir}"
+              grep "  ${tarball}\$" "${checksums}" | sha512sum -c -
+          )
+          tar -xz -C "$HOME/.local/bin" -f "${tmpdir}/${tarball}" ratchet
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/ratchet" -version
+
+      # ── 4a. Count unpinned actions before ratchet runs ───────────────
+      # Counts any 'uses:' line that does NOT already reference a full
+      # 40-character hex SHA, giving us the "before" baseline for metrics.
+      - name: Count unpinned actions (before)
+        id: before
+        if: steps.detect.outputs.count != '0'
+        run: |
+          count=$(grep -REh '^[[:space:]]*uses:[[:space:]]*[^#[:space:]]+@' .github/workflows/ 2>/dev/null \
+              | grep -Ev '^[[:space:]]*uses:[[:space:]]*(\./|docker://)' \
+              | grep -Ev '@[0-9a-f]{40}([[:space:]]|$)' \
+              | wc -l | tr -d '[:space:]')
+          echo "unpinned=${count}" >> "$GITHUB_OUTPUT"
+          echo "Unpinned action refs before ratchet: ${count}"
+
+      # ── 4. Pin all action refs to their commit SHAs ───────────────────
+      # ratchet reads GITHUB_TOKEN to resolve tags to SHAs via the GitHub
+      # API. The App token is used so that tags in private org repos can be
+      # resolved alongside public ones (e.g. actions/checkout).
+      #
+      # NOTE: ratchet also pins reusable workflow calls
+      # (uses: org/repo/.github/workflows/file.yml@ref). If you prefer
+      # to keep those at a branch or tag ref, use ratchet's --exclude flag
+      # or add 'ratchet:exclude' comments to specific lines before running.
+      - name: Pin actions with ratchet
+        if: steps.detect.outputs.count != '0'
+        env:
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # -print0 / xargs -0 handles filenames with spaces correctly.
+          find .github/workflows -maxdepth 1 \
+              \( -name '*.yml' -o -name '*.yaml' \) -type f -print0 \
+              | xargs -0 ratchet pin
+
+      # ── 5. Rewrite ratchet comments to the format Dependabot expects ─────
+      # ratchet annotates pinned lines as:
+      #   uses: owner/action@<SHA> # ratchet:owner/action@v4
+      #
+      # Dependabot requires the bare version tag as the comment:
+      #   uses: owner/action@<SHA> # v4
+      #
+      # The sed expression strips the '# ratchet:owner/action@' prefix,
+      # leaving only '# v4' (or whatever tag ratchet resolved from).
+      # This is safe to run unconditionally — files with no ratchet
+      # annotations are left unchanged.
+      - name: Rewrite ratchet comments for Dependabot compatibility
+        if: steps.detect.outputs.count != '0'
+        run: |
+          find .github/workflows -maxdepth 1 \
+              \( -name '*.yml' -o -name '*.yaml' \) -type f -print0 \
+              | xargs -0 sed -i 's| # ratchet:[^@]*@| # |g'
+
+      # ── 6. Check whether ratchet produced any changes ──────────────────
+      - name: Check for changes
+        id: diff
+        if: steps.detect.outputs.count != '0'
+        run: |
+          if git diff --quiet; then
+              echo "has_changes=false" >> "$GITHUB_OUTPUT"
+              echo "✅ All actions already pinned in ${{ matrix.repo }} — no PR needed."
+          else
+              echo "has_changes=true" >> "$GITHUB_OUTPUT"
+              echo "Changes detected:"
+              git diff --stat
+          fi
+
+      # ── 6a. Collect and publish per-repo metrics ──────────────────────
+      # Derives newly_pinned as (before - after) rather than parsing the
+      # diff. This avoids overcounting lines where only the inline comment
+      # was rewritten (e.g. the sed step converting ratchet-format comments
+      # to Dependabot-format) — those produce a '+' diff line matching the
+      # SHA pattern even though nothing was newly pinned.
+      - name: Collect metrics
+        id: metrics
+        run: |
+          if [[ "${{ steps.detect.outputs.count }}" == "0" ]]; then
+              # No workflow files detected for this repo; report zeros.
+              unpinned=0
+              newly_pinned=0
+          else
+              after=$(grep -REh '^[[:space:]]*uses:[[:space:]]*[^#[:space:]]+@' .github/workflows/ 2>/dev/null \
+                  | grep -Ev '^[[:space:]]*uses:[[:space:]]*(\./|docker://)' \
+                  | grep -Ev '@[0-9a-f]{40}([[:space:]]|$)' \
+                  | wc -l | tr -d '[:space:]')
+
+              unpinned="${{ steps.before.outputs.unpinned }}"
+              newly_pinned=$(( unpinned - after ))
+          fi
+
+          mkdir -p metrics
+          echo "{\"repo\":\"${{ matrix.repo }}\",\"unpinned\":${unpinned},\"newly_pinned\":${newly_pinned}}" \
+              > metrics/metrics.json
+
+          # Append a row to this job's Summary page
+          if [[ ! -s "$GITHUB_STEP_SUMMARY" ]] || ! grep -q '| Repo |' "$GITHUB_STEP_SUMMARY"; then
+              printf '| Repo | Unpinned before | Newly pinned |\n' >> "$GITHUB_STEP_SUMMARY"
+              printf '|------|----------------:|--------------:|\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          printf '| `%s` | %s | %s |\n' \
+              "${{ matrix.repo }}" "${unpinned}" "${newly_pinned}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload metrics artifact
+        if: steps.detect.outputs.count != '0'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: metrics-${{ matrix.repo }}
+          path: metrics/metrics.json
+          retention-days: 7
+
+      # ── 6b. Dry run: print the full diff and stop ──────────────────────
+      - name: "[DRY RUN] Show proposed changes"
+        if: steps.diff.outputs.has_changes == 'true' && env.DRY_RUN == 'true'
+        run: |
+          echo "════════════════════════════════════════════════════"
+          echo " DRY RUN — proposed changes for ${{ matrix.repo }}"
+          echo "════════════════════════════════════════════════════"
+          git diff
+
+      # ── 6c. Live: create branch and commit via the GitHub Contents API ────
+      # Commits created through the Contents API using a GitHub App token are
+      # automatically verified (signed) by GitHub. This satisfies branch
+      # protection rules that require signed commits (e.g. vigilant mode),
+      # which a git-push of a locally-created commit cannot do.
+      - name: Create branch and commit pinned files via API
+        if: steps.diff.outputs.has_changes == 'true' && env.DRY_RUN == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          default_branch=$(gh api "repos/${ORG}/${{ matrix.repo }}" --jq '.default_branch')
+          head_sha=$(gh api "repos/${ORG}/${{ matrix.repo }}/git/ref/heads/${default_branch}" \
+              --jq '.object.sha')
+
+          # Create the branch from the current default branch HEAD.
+          # If the branch already exists from a previous run, force-reset it
+          # to the current HEAD so stale commits do not accumulate.
+          if ! gh api --method POST "repos/${ORG}/${{ matrix.repo }}/git/refs" \
+                  -f ref="refs/heads/${BRANCH_NAME}" \
+                  -f sha="${head_sha}" 2>/dev/null; then
+              gh api --method PATCH \
+                  "repos/${ORG}/${{ matrix.repo }}/git/refs/heads/${BRANCH_NAME}" \
+                  -f sha="${head_sha}" \
+                  -F force=true
+          fi
+
+          # Commit each ratchet-modified file individually via the Contents API.
+          # Each PUT requires the current blob SHA of the file on the target
+          # branch to prevent lost-update conflicts (acts as an optimistic lock).
+          while IFS= read -r filepath; do
+              file_blob_sha=$(gh api \
+                  "repos/${ORG}/${{ matrix.repo }}/contents/${filepath}?ref=${BRANCH_NAME}" \
+                  --jq '.sha')
+
+              encoded_content=$(base64 -w 0 < "${filepath}")
+
+              gh api --method PUT "repos/${ORG}/${{ matrix.repo }}/contents/${filepath}" \
+                  -f message="security: pin $(basename "${filepath}") actions to commit SHAs" \
+                  -f content="${encoded_content}" \
+                  -f sha="${file_blob_sha}" \
+                  -f branch="${BRANCH_NAME}"
+
+              echo "  ✔ Committed ${filepath}"
+          done < <(git diff --name-only)
+
+      # ── 6d. Live: ensure PR labels exist in the target repo ─────────────
+      # gh label create --force is idempotent: creates the label if absent,
+      # or updates its color and description if it already exists.
+      # Colors and descriptions match Dependabot's standard label conventions.
+      - name: Ensure PR labels exist
+        if: steps.diff.outputs.has_changes == 'true' && env.DRY_RUN == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh label create "dependencies" \
+              --repo "${ORG}/${{ matrix.repo }}" \
+              --color "0969da" \
+              --description "Pull requests that update a dependency file" \
+              --force
+
+          gh label create "github_actions" \
+              --repo "${ORG}/${{ matrix.repo }}" \
+              --color "25292e" \
+              --description "Pull requests that update GitHub Actions files" \
+              --force
+
+      # ── 6e. Live: open the PR (or surface the URL if it already exists) ─
+      - name: Open pull request
+        if: steps.diff.outputs.has_changes == 'true' && env.DRY_RUN == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_BODY: |
+            This PR was automatically generated to harden workflow security.
+
+            All `uses:` references that were pinned to semver tags have been rewritten to pin to the full-length commit SHA for that release, with the semver tag preserved as an inline comment.
+
+            **Example:**
+            ```yaml
+            # Before
+            uses: actions/checkout@v6.0.2
+
+            # After
+            uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+            ```
+
+            This is a prerequisite to safely enabling the org policy: **Require actions to be pinned to a full-length commit SHA**.
+
+            ---
+            *Generated by the [pin-actions-to-sha](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) workflow.*
+        run: |
+          set -euo pipefail
+
+          default_branch=$(gh api "repos/${ORG}/${{ matrix.repo }}" --jq '.default_branch')
+
+          # gh pr create exits non-zero when a PR for this branch already
+          # exists. Capture output and stderr together so we can inspect it.
+          if pr_url=$(gh pr create \
+                  --repo "${ORG}/${{ matrix.repo }}" \
+                  --head "${BRANCH_NAME}" \
+                  --base "${default_branch}" \
+                  --title "${PR_TITLE}" \
+                  --body "${PR_BODY}" \
+                  --label "dependencies" \
+                  --label "github_actions" \
+                  2>&1); then
+              echo "🚀 PR opened: ${pr_url}"
+          else
+              # Surface the existing PR URL rather than failing the step.
+              existing=$(gh pr view \
+                  --repo "${ORG}/${{ matrix.repo }}" \
+                  "${BRANCH_NAME}" \
+                  --json url --jq '.url' 2>/dev/null || true)
+              if [[ -n "$existing" ]]; then
+                  echo "ℹ PR already exists: ${existing}"
+              else
+                  echo "::error::Failed to open PR for ${{ matrix.repo }}: ${pr_url}"
+                  exit 1
+              fi
+          fi
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 3: Aggregate per-repo metrics and write a grand-total summary.
+  # ─────────────────────────────────────────────────────────────────────────
+  summarize:
+    name: Summarize metrics
+    needs: pin-actions
+    if: always() && needs.pin-actions.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read # required to download artifacts from sibling jobs
+
+    steps:
+      - name: Download all metrics artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: metrics-*
+          path: metrics
+          merge-multiple: false
+
+      - name: Aggregate and write summary
+        run: |
+          set -euo pipefail
+
+          total_unpinned=0
+          total_pinned=0
+          repos_with_changes=0
+          repos_processed=0
+
+          {
+              echo "## Pin-Actions-to-SHA Metrics"
+              echo ""
+              echo "**Mode:** ${{ inputs.dry_run == 'true' && 'Dry run' || 'Live' }} &nbsp;|&nbsp; **Org:** \`${{ env.ORG }}\`"
+              echo ""
+              echo "| Repo | Unpinned before | Newly pinned |"
+              echo "|------|----------------:|-------------:|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Each artifact lands in its own subdirectory: metrics/metrics-<repo>/metrics.json
+          for f in metrics/*/metrics.json; do
+              [[ -f "$f" ]] || continue
+              repo=$(jq -r '.repo' "$f")
+              unpinned=$(jq -r '.unpinned' "$f")
+              newly_pinned=$(jq -r '.newly_pinned' "$f")
+
+              total_unpinned=$(( total_unpinned + unpinned ))
+              total_pinned=$(( total_pinned + newly_pinned ))
+              repos_processed=$(( repos_processed + 1 ))
+              [[ "$newly_pinned" -gt 0 ]] && repos_with_changes=$(( repos_with_changes + 1 ))
+
+              echo "| \`${repo}\` | ${unpinned} | ${newly_pinned} |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          {
+              echo "| **Total** | **${total_unpinned}** | **${total_pinned}** |"
+              echo ""
+              echo "**Repos processed:** ${repos_processed} &nbsp;|&nbsp; **Repos with changes:** ${repos_with_changes}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Repos processed:     ${repos_processed}"
+          echo "Repos with changes:  ${repos_with_changes}"
+          echo "Total unpinned refs: ${total_unpinned}"
+          echo "Total newly pinned:  ${total_pinned}"
