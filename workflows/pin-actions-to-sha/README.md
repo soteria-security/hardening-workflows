@@ -31,7 +31,7 @@ The workflow runs three jobs:
    - In **dry-run mode**: prints the full diff and stops — no branch, no commit, no PR
    - In **live mode**: creates a branch, commits each modified file individually via the GitHub Contents API (producing signed commits), creates any missing PR labels, and opens a pull request
 
-3. **`summarize`** — Downloads per-repo metrics artifacts from all matrix jobs and writes a grand-total summary table to the workflow run's summary page showing unpinned counts before and after.
+3. **`summarize`** — Downloads per-repo metrics artifacts from matrix jobs that uploaded them and writes a grand-total summary table to the workflow run's summary page showing unpinned counts before and after. Repos with no workflow files are skipped earlier and are therefore omitted from the per-repo summary.
 
 ---
 
